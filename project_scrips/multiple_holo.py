@@ -39,13 +39,9 @@ def process_fft_tensor(fft_tensor, fft_crop_coords):
     # Perform computations on GPU
     cropped_fft = crop_tensor(fft_tensor, fft_crop_coords)
     reconstructed_field = ifft2(ifftshift(cropped_fft, dim=(-2, -1)), dim=(-2, -1))
-    reconstructed_amplitude = torch.abs(reconstructed_field)
-    reconstructed_phase = torch.angle(reconstructed_field)
 
     # Move results back to CPU
-    return (reconstructed_field.cpu(),
-            reconstructed_amplitude.cpu(),
-            reconstructed_phase.cpu())
+    return reconstructed_field.cpu()
 
 
 def perform_fft_on_tensor_individually(images_tensor, use_gpu=True):
@@ -181,7 +177,7 @@ def create_results_directory(base_folder, has_ref_images):
     os.makedirs(results_dir, exist_ok=True)
 
     # Create subdirectories for each category of output
-    subfolders = ['cropped_images', 'reconstructed_amplitudes', 'reconstructed_phases', 'original_fields']
+    subfolders = ['cropped_data', 'original_fields']
     if has_ref_images:
         subfolders.append('normalized_original_fields')
 
@@ -193,60 +189,39 @@ def create_results_directory(base_folder, has_ref_images):
 
     return paths
 
-
-def save_file(path, data, is_image=True):
-    if is_image:
-        Image.fromarray(np.uint8(data)).save(path)
-    else:
-        np.save(path, data)
+def save_file(path, data):
+    np.save(path, data)
 
 
-def save_results_parallel(paths, base_filename, cropped_image, reconstructed_amplitude, reconstructed_phase,
-                          reconstructed_field, normalized_field=None):
-    # Normalize the cropped image for 16-bit depth before converting to 8-bit
-    cropped_image_normalized = (cropped_image - cropped_image.min()) / (cropped_image.max() - cropped_image.min()) * 255
-
-    # Normalize the reconstructed amplitude image
-    reconstructed_amplitude_normalized = reconstructed_amplitude * 255 / np.max(reconstructed_amplitude)
-
-    # Normalize and scale the reconstructed phase image to 8-bit
-    reconstructed_phase_normalized = (reconstructed_phase + np.pi) / (2 * np.pi) * 255
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+def save_results_parallel(paths, base_filename, cropped_image, reconstructed_field, normalized_field=None):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3 if normalized_field is not None else 2) as executor:
         futures = [
-            executor.submit(save_file, os.path.join(paths['cropped_images'], f"{base_filename}_cropped.png"),
-                            cropped_image_normalized),
-            executor.submit(save_file,
-                            os.path.join(paths['reconstructed_amplitudes'], f"{base_filename}_amplitude.png"),
-                            reconstructed_amplitude_normalized),
-            executor.submit(save_file, os.path.join(paths['reconstructed_phases'], f"{base_filename}_phase.png"),
-                            reconstructed_phase_normalized),
-            executor.submit(save_file, os.path.join(paths['original_fields'], f"{base_filename}_matrix.npy"),
-                            reconstructed_field, False)
+            executor.submit(np.save, os.path.join(paths['cropped_data'], f"{base_filename}_cropped.npy"),
+                            cropped_image),
+            executor.submit(np.save, os.path.join(paths['original_fields'], f"{base_filename}_matrix.npy"),
+                            reconstructed_field)
         ]
 
         if normalized_field is not None:
-            futures.append(executor.submit(save_file,
+            futures.append(executor.submit(np.save,
                                            os.path.join(paths['normalized_original_fields'], f"{base_filename}_normalized.npy"),
-                                           normalized_field, False))
+                                           normalized_field))
 
         concurrent.futures.wait(futures)
 
-
 def process_batch(batch_fft, fft_crop_coords, mean_abs_ref_field=None):
-    reconstructed_fields, reconstructed_amplitudes, reconstructed_phases = process_fft_tensor(batch_fft,
-                                                                                              fft_crop_coords)
+    reconstructed_fields = process_fft_tensor(batch_fft, fft_crop_coords)
 
     normalized_fields = None
     if mean_abs_ref_field is not None:
         # Normalize each field by the square root of the mean reference intensity
         normalized_fields = reconstructed_fields / torch.sqrt(mean_abs_ref_field)
 
-    return reconstructed_fields, reconstructed_amplitudes, reconstructed_phases, normalized_fields
+    return reconstructed_fields, normalized_fields
 
 
 def save_batch_results(batch_data, results_paths, pbar_save):
-    base_filenames, cropped_images, reconstructed_amplitudes, reconstructed_phases, reconstructed_fields, normalized_fields = batch_data
+    base_filenames, cropped_images, reconstructed_fields, normalized_fields = batch_data
     futures = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         for j, base_filename in enumerate(base_filenames):
@@ -255,8 +230,6 @@ def save_batch_results(batch_data, results_paths, pbar_save):
                 results_paths,
                 base_filename,
                 cropped_images[j],
-                reconstructed_amplitudes[j],
-                reconstructed_phases[j],
                 reconstructed_fields[j],
                 normalized_fields[j] if normalized_fields is not None else None
             )
@@ -267,7 +240,6 @@ def save_batch_results(batch_data, results_paths, pbar_save):
             pbar_save.update(1)
 
     pbar_save.refresh()
-
 
 def saving_worker(processed_queue, results_paths, pbar_save):
     while True:
@@ -327,13 +299,13 @@ if has_ref_images:
     print(f"Main fft_crop_coords: {fft_crop_coords}")
     print(f"Reference ref_crop_coords: {ref_crop_coords}")
 
-    reconstructed_ref_fields, _, _ = process_fft_tensor(ref_images_fft_tensor, ref_crop_coords)
+    reconstructed_ref_fields = process_fft_tensor(ref_images_fft_tensor, ref_crop_coords)
     mean_abs_ref_field = torch.mean(torch.abs(reconstructed_ref_fields) ** 2, dim=0)
 else:
     mean_abs_ref_field = None
 
 torch.cuda.empty_cache()
-batch_size = 360  # Adjust based on your GPU memory
+batch_size = 100  # Adjust based on your GPU memory
 total_batches = (len(files) + batch_size - 1) // batch_size
 
 # Create a queue to hold processed batches
@@ -352,24 +324,19 @@ try:
         batch_files = files[i:i + batch_size]
         batch_fft = images_fft_tensor[i:i + batch_size].to(device)
 
-        reconstructed_fields, reconstructed_amplitudes, reconstructed_phases, normalized_fields = process_batch(
-            batch_fft, fft_crop_coords, mean_abs_ref_field)
+        reconstructed_fields, normalized_fields = process_batch(batch_fft, fft_crop_coords, mean_abs_ref_field)
 
         base_filenames = [os.path.basename(os.path.splitext(f)[0]) for f in batch_files]
 
         # Move results to CPU and convert to numpy arrays
         cropped_images = cropped_images_tensor[i:i + batch_size].cpu().numpy()
-        reconstructed_amplitudes = reconstructed_amplitudes.cpu().numpy()
-        reconstructed_phases = reconstructed_phases.cpu().numpy()
         reconstructed_fields = reconstructed_fields.cpu().numpy()
 
         # Clear GPU memory
         torch.cuda.empty_cache()
 
         # Put processed batch in the queue
-        processed_queue.put(
-            (base_filenames, cropped_images, reconstructed_amplitudes, reconstructed_phases, reconstructed_fields,
-             normalized_fields))
+        processed_queue.put((base_filenames, cropped_images, reconstructed_fields, normalized_fields))
 
         pbar_process.update(1)
 
