@@ -253,7 +253,7 @@ array_1_path = filedialog.askopenfilename(
 )
 # Ask for the second field
 array_2_path = filedialog.askopenfilename(
-    initialdir=init_dir, fil etypes=[("NumPy files", "*.npy"), ("Image files", "*.jpeg;*.jpg;*.tiff;*.tif;*.png")],
+    initialdir=init_dir, filetypes=[("NumPy files", "*.npy"), ("Image files", "*.jpeg;*.jpg;*.tiff;*.tif;*.png")],
     title='Select Field 2 to propagate.')
 
 root.destroy()
