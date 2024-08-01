@@ -1,26 +1,181 @@
-from matplotlib.widgets import Slider
 import torch
-import matplotlib.pyplot as plt
-import torch.fft
+import torch.nn.functional as F
+from torch.fft import fftshift, ifftshift, fft2 as fft, ifft2 as ifft
 from tqdm import tqdm
 import matplotlib
-from PIL import Image
-import tifffile as tiff
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.widgets import Slider, Button
 import imageio.v3 as iio
 import tkinter as tk
-from tkinter import filedialog
 from scipy.ndimage import zoom
-from numpy.fft import fft2 as fft
-from numpy.fft import ifft2 as ifft
 import colorsys
 import numpy as np
 from tkinter import filedialog, Tk
 from PIL import Image
-from numpy.fft import fftshift, ifftshift
+import time
+
 matplotlib.use('TkAgg')
 plt.ion()
 
+def update(val):
+    z_index1 = int((slider1.val - z_min) / ((z_max - z_min) / (num_z - 1)))
+    im_1.set_data(np.abs(array_1_all_numpy[z_index1]))
+    ax1.set_title(f'Propagated Field 1 (z = {z_values[z_index1]:.2f} m)')
+    psf_size_1 = theta * z_values[z_index1] * 1e3  # in mm
+    normalized_psf_size_1 = np.abs(psf_size_1 / (extent_1[1] - extent_1[0]))  # Normalize relative to the plot's width
+    psf_line_1.set_data([0.05, 0.05 + normalized_psf_size_1], [0.9, 0.9])  # Horizontal line from (0.05, 0.9) to (0.05 + normalized_psf_size_1, 0.9)
+
+    z_index2 = int((slider2.val - z_min) / ((z_max - z_min) / (num_z - 1)))
+    im_2.set_data(np.abs(array_2_all_numpy[z_index2]))
+    ax2.set_title(f'Propagated Field 2 (z = {z_values[z_index2]:.2f} m)')
+    psf_size_2 = theta * z_values[z_index2] * 1e3  # in mm
+    normalized_psf_size_2 = np.abs(psf_size_2 / (extent_2[1] - extent_2[0]))  # Normalize relative to the plot's width
+    psf_line_2.set_data([0.05, 0.05 + normalized_psf_size_2], [0.9, 0.9])  # Horizontal line from (0.05, 0.9) to (0.05 + normalized_psf_size_2, 0.9)
+
+    ax1.set_xlim(xlim1)
+    ax1.set_ylim(ylim1)
+    ax2.set_xlim(xlim2)
+    ax2.set_ylim(ylim2)
+    fig.canvas.draw_idle()
+def store_zoom_levels(event):
+    global xlim1, ylim1, xlim2, ylim2
+    xlim1 = ax1.get_xlim()
+    ylim1 = ax1.get_ylim()
+    xlim2 = ax2.get_xlim()
+    ylim2 = ax2.get_ylim()
+
+def roll_fft(event):
+    global array_1_fft_rolled, array_2_fft_rolled
+    ax = event.inaxes
+    if ax == ax1:
+        y, x = int(event.ydata), int(event.xdata)
+        rows_to_roll = array_1_fft_rolled.shape[0] // 2 - y
+        cols_to_roll = array_1_fft_rolled.shape[1] // 2 - x
+        array_1_fft_rolled = torch.roll(array_1_fft_rolled, shifts=(rows_to_roll, cols_to_roll), dims=(0, 1))
+        update_plot(ax1, array_1_fft_rolled)
+    elif ax == ax2:
+        y, x = int(event.ydata), int(event.xdata)
+        rows_to_roll = array_2_fft_rolled.shape[0] // 2 - y
+        cols_to_roll = array_2_fft_rolled.shape[1] // 2 - x
+        array_2_fft_rolled = torch.roll(array_2_fft_rolled, shifts=(rows_to_roll, cols_to_roll), dims=(0, 1))
+        update_plot(ax2, array_2_fft_rolled)
+    plt.draw()
+
+def update_plot(ax, field):
+    rgb_image = create_rgb_image(field)
+    ax.get_images()[0].set_data(rgb_image)
+
+
+def create_rgb_image(field):
+    if isinstance(field, torch.Tensor):
+        field = field.detach().cpu().numpy()
+
+    phase = np.angle(field)
+    amplitude = np.abs(field)
+    amplitude = np.log1p(amplitude)  # Use log scale for amplitude
+    amplitude = amplitude / np.max(amplitude)
+
+    phase_normalized = (phase + np.pi) / (2 * np.pi)
+    hsv_image = np.zeros((field.shape[0], field.shape[1], 3), dtype=np.float64)
+    hsv_image[:, :, 0] = phase_normalized
+    hsv_image[:, :, 1] = 1.0
+    hsv_image[:, :, 2] = amplitude
+
+    rgb_image = np.zeros_like(hsv_image)
+    for i in range(hsv_image.shape[0]):
+        for j in range(hsv_image.shape[1]):
+            rgb_image[i, j] = colorsys.hsv_to_rgb(hsv_image[i, j, 0], hsv_image[i, j, 1], hsv_image[i, j, 2])
+
+    return rgb_image
+
+
+def phplot(field, ax=None, log_scale=True):
+    rgb_image = create_rgb_image(field)
+
+    if ax is None:
+        ax = plt.gca()
+
+    im = ax.imshow(rgb_image)
+    ax.axis('off')
+
+    cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
+    cbar_ticks = np.linspace(-np.pi, np.pi, 9)
+    cbar_labels = [f'{t:.2f}' for t in cbar_ticks]
+    cbar.set_ticks(np.linspace(0, 1, 9))
+    cbar.set_ticklabels(cbar_labels)
+    cbar.set_label('Phase (radians)')
+
+    return im
+
+
+# Global variables for optimization and drag control
+last_update_time = 0
+update_interval = 0.1  # Update every 100ms
+preview_scale = 0.25  # Scale factor for preview during drag
+is_dragging = False
+
+
+def drag_roll(event):
+    global array_1_fft_rolled, array_2_fft_rolled, start_x, start_y, last_update_time, is_dragging
+
+    if not is_dragging:
+        return
+
+    current_time = time.time()
+    if current_time - last_update_time < update_interval:
+        return  # Skip this update if it's too soon
+
+    if event.inaxes == ax1 or event.inaxes == ax2:
+        dx = int(start_x - event.xdata)
+        dy = int(start_y - event.ydata)
+
+        if event.inaxes == ax1:
+            array_1_fft_rolled = torch.roll(array_1_fft_rolled, shifts=(-dy, -dx), dims=(0, 1))
+            update_plot_preview(ax1, array_1_fft_rolled)
+        else:
+            array_2_fft_rolled = torch.roll(array_2_fft_rolled, shifts=(-dy, -dx), dims=(0, 1))
+            update_plot_preview(ax2, array_2_fft_rolled)
+
+        start_x, start_y = event.xdata, event.ydata
+        last_update_time = current_time
+        plt.draw()
+
+
+def update_plot_preview(ax, field):
+    preview = create_preview(field)
+    ax.get_images()[0].set_data(preview)
+
+
+def create_preview(field):
+    # Create a lower resolution preview
+    preview = field[::4, ::4]  # Take every 4th pixel
+    return create_rgb_image(preview)
+
+
+def on_press(event):
+    global start_x, start_y, is_dragging
+    if event.inaxes == ax1 or event.inaxes == ax2:
+        start_x, start_y = event.xdata, event.ydata
+        is_dragging = True
+
+
+def on_release(event):
+    global start_x, start_y, is_dragging
+    if is_dragging:
+        if event.inaxes == ax1:
+            update_plot(ax1, array_1_fft_rolled)
+        elif event.inaxes == ax2:
+            update_plot(ax2, array_2_fft_rolled)
+    start_x, start_y = 0, 0
+    is_dragging = False
+    plt.draw()
+
+
+
+
+def confirm(event):
+    plt.close()
 
 def load_array_or_image(file_path):
     if file_path.endswith('.npy'):
@@ -31,79 +186,20 @@ def load_array_or_image(file_path):
         return np.array(image)
 
 
-def phplot(field, ax=None, log_scale=False):
-    """
-    Plots the phase of the input field using the HSV color space,
-    where hue represents the phase and brightness represents the normalized amplitude.
-    Adds a colorbar to visualize the phase mapping. Optionally uses log scale for amplitude.
-
-    Parameters:
-    field (numpy.ndarray): The complex-valued input field.
-    ax (matplotlib.axes.Axes, optional): The axes to plot on. Defaults to current axes.
-    log_scale (bool, optional): Whether to use logarithmic scale for amplitude. Defaults to False.
-
-    Returns:
-    None
-    """
-    if isinstance(field, torch.Tensor):
-        field = field.detach().cpu().numpy()  # Convert PyTorch tensor to NumPy array
-
-    if field.ndim == 3 and field.shape[2] == 3:  # If the input is an RGB image
-        field = np.mean(field, axis=2)  # Convert to grayscale by averaging the RGB channels
-        field = field.astype(np.complex128)  # Convert to complex type for demonstration
-        # Generate a complex field with some arbitrary phase and amplitude for visualization
-        field = field * np.exp(1j * field)
-
-    phase = np.angle(field)  # Phase of the field
-    amplitude = np.abs(field)  # Amplitude of the field
-
-    if log_scale:
-        amplitude = np.log1p(amplitude)  # Use log scale for amplitude
-
-    amplitude = amplitude / np.max(amplitude)  # Normalize the amplitude
-
-    # Convert phase from radians to the range [0, 1] for HSV colormap
-    phase_normalized = (phase + np.pi) / (2 * np.pi)
-
-    # Create an HSV image where hue represents phase and value represents amplitude
-    hsv_image = np.zeros((field.shape[0], field.shape[1], 3), dtype=np.float64)
-    hsv_image[:, :, 0] = phase_normalized  # Hue
-    hsv_image[:, :, 1] = 1.0  # Saturation (full saturation)
-    hsv_image[:, :, 2] = amplitude  # Value (brightness)
-
-    # Convert HSV image to RGB
-    rgb_image = np.zeros_like(hsv_image)
-    for i in range(hsv_image.shape[0]):
-        for j in range(hsv_image.shape[1]):
-            rgb_image[i, j] = colorsys.hsv_to_rgb(hsv_image[i, j, 0], hsv_image[i, j, 1], hsv_image[i, j, 2])
-
-    if ax is None:
-        ax = plt.gca()  # Get current axes if none is provided
-
-    # Plot the RGB image
-    im = ax.imshow(rgb_image)
-    ax.axis('off')
-
-    # Create a colorbar to represent the phase
-    cbar = plt.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-
-    # Create a colormap for the colorbar that matches the HSV colormap
-    cbar_ticks = np.linspace(-np.pi, np.pi, 9)  # Define ticks from -π to π
-    cbar_labels = [f'{t:.2f}' for t in cbar_ticks]  # Format labels
-    cbar.set_ticks(np.linspace(0, 1, 9))
-    cbar.set_ticklabels(cbar_labels)
-    cbar.set_label('Phase (radians)')
 
 
 def fresnel_propagation(initial_field, dx, dy, z, wavelength):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Convert initial field to PyTorch tensor and move to GPU if available
-    # field_fft = np.fft.fft2(initial_field)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # field_fft = fft(initial_field)
     # padding_size = 1000  # array.shape[0]//8
     # padded_field_fft = np.pad(field_fft, ((padding_size, padding_size), (padding_size, padding_size)), mode='constant')
-    # padded_field = np.fft.ifft2(padded_field_fft)
+    # padded_field = ifft(padded_field_fft)
     # new_dx = dx*(initial_field.shape[0]/(initial_field.shape[0] + 2 * padding_size))
-    field = torch.from_numpy(initial_field).to(device).to(dtype=torch.complex64)
+    if not isinstance(initial_field, torch.Tensor):
+        field = torch.from_numpy(initial_field).to(device).to(dtype=torch.complex64)
+    else:
+        field = initial_field.to(device).to(dtype=torch.complex64)
     [Nx, Ny] = field.shape
     k = 2 * np.pi / wavelength
     # Create coordinate grids
@@ -117,131 +213,12 @@ def fresnel_propagation(initial_field, dx, dy, z, wavelength):
         torch.tensor(-1j * np.pi * wavelength, device=device) * z_tensor * (FX ** 2 + FY ** 2)
     )
     # Propagated field
-    field_propagated = torch.fft.ifft2(torch.fft.fft2(field) * H)
-    return field_propagated.cpu().numpy()  # Move result back to CPU and convert to numpy array
-
-
-def create_field(sigma, center_x, center_y, Nx, Ny):
-    """
-    Create a Gaussian field with given parameters.
-
-    Parameters:
-    - sigma: Standard deviation of the Gaussian (controls the width/narrowness).
-    - center_x, center_y: The center of the Gaussian in the grid.
-    - Nx, Ny: The size of the grid (number of points in x and y directions).
-
-    Returns:
-    - A 2D numpy array representing the Gaussian field.
-    """
-    x = np.linspace(0, Nx - 1, Nx)
-    y = np.linspace(0, Ny - 1, Ny)
-    X, Y = np.meshgrid(x, y)
-
-    # Calculate the 2D Gaussian
-    gaussian = np.exp(-(((X - center_x) ** 2) / (2 * sigma ** 2) + ((Y - center_y) ** 2) / (2 * sigma ** 2)))
-
-    return gaussian
-
-def create_line_field(line_length, line_width, num_lines_x, num_lines_y, Nx, Ny):
-    """
-    Create a field with specified number of horizontal and vertical lines in the center of the matrix.
-
-    Parameters:
-    - line_length: The length of each line.
-    - line_width: The thickness of each line.
-    - num_lines_x: Number of vertical lines.
-    - num_lines_y: Number of horizontal lines.
-    - Nx, Ny: The size of the grid (number of points in x and y directions).
-
-    Returns:
-    - A 2D numpy array representing the field with lines.
-    """
-    field = np.zeros((Nx, Ny))
-
-    # Center points
-    center_x, center_y = Nx // 2, Ny // 2
-
-    # Horizontal lines
-    if num_lines_y > 0:
-        h_total_height = num_lines_y * (line_width * 2) - line_width
-        h_start = center_x - h_total_height // 2
-        for i in range(num_lines_y):
-            y_position = h_start + i * 2 * line_width
-            field[y_position : y_position + line_width, center_y - line_length // 2 : center_y + line_length // 2] = 1
-
-    # Vertical lines
-    if num_lines_x > 0:
-        v_total_width = num_lines_x * (line_width * 2) - line_width
-        v_start = center_y - v_total_width // 2
-        for i in range(num_lines_x):
-            x_position = v_start + i * 2 * line_width
-            field[center_x - line_length // 2 : center_x + line_length // 2, x_position : x_position + line_width] = 1
-
-    return field
+    field_propagated = ifft(fft(field) * H)
+    return field_propagated
 
 
 
-def load_and_resize_image_as_npy(dx=1e-6, wanted_size=1e-3):
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg;*.jpeg;*.tif;*.png")])
-    if not file_path:
-        return None
-    try:
-        image = iio.imread(file_path)
-        if image.ndim == 3:
-            # Convert to grayscale by averaging the color channels
-            image = np.mean(image, axis=2)
 
-        # Calculate the desired number of pixels
-        wanted_size_pixels = int(wanted_size / dx)
-
-        # Get the current size of the image
-        current_size_pixels = image.shape
-
-        # Calculate the zoom factors for each dimension
-        zoom_factors = [wanted_size_pixels / current_size_pixels[0], wanted_size_pixels / current_size_pixels[1]]
-
-        # Resize the image
-        resized_image_array = zoom(image, zoom_factors, order=1)  # Use order=1 for bilinear interpolation
-        # Threshold the image to make it binary
-        threshold = resized_image_array.mean()
-        binary_image_array = (resized_image_array > threshold).astype(np.uint8)
-
-        return binary_image_array
-    except Exception as e:
-        print(f"Error loading image: {e}")
-        return None
-
-
-# Example usage:
-size = 62 // 3
-width = 5
-line_length, line_width, num_lines_x, num_lines_y, Nx, Ny = size , width , int(0.5 * size / width), 0, 800, 800
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
-# Create the line field
-line_field = create_line_field(line_length, line_width, num_lines_x, num_lines_y, Nx, Ny)
-np.save('cross field', line_field)
-# plt.figure()
-# plt.imshow(line_field)
-# plt.show()
-
-# final_image_size = 600
-# real_area = 2472*5.5e-6
-# dx = real_area / final_image_size
-# image_array = 1 - load_and_resize_image_as_npy(dx=dx, wanted_size=1e-3)
-# padding_size = (final_image_size-image_array.shape[0]) // 2
-# padded_image_array = np.pad(image_array, ((padding_size, padding_size), (padding_size, padding_size)), mode='constant')
-# plt.figure()
-# plt.imshow(padded_image_array)
-# plt.show()
-# np.save('1 mm USAF at 0', padded_image_array)
-
-
-
-sigma = 15  # Standard deviation of the Gaussian
-center_x, center_y = Nx // 2, Ny // 2  # Center of the Gaussian
-gaussian_field = create_field(sigma, center_x, center_y, Nx, Ny)
 # Load the initial field from a .npy file
 init_dir = 'D:\Lab Images and data local'
 root = tk.Tk()
@@ -262,57 +239,59 @@ root.destroy()
 original_array_1 = load_array_or_image(array_1_path)
 original_array_2 = load_array_or_image(array_2_path)
 
+# Convert to PyTorch tensors and move to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+original_array_1 = torch.from_numpy(original_array_1).to(device).to(torch.complex64)
+original_array_2 = torch.from_numpy(original_array_2).to(device).to(torch.complex64)
 
 # Normalization
-original_array_1 = original_array_1.astype(np.complex64)
-original_array_1 /= np.max(np.abs(original_array_1))
-original_array_2 = original_array_2.astype(np.complex64)
-original_array_2 /= np.max(np.abs(original_array_2))
+original_array_1 /= torch.max(torch.abs(original_array_1))
+original_array_2 /= torch.max(torch.abs(original_array_2))
 
+# Compute FFTs
 array_1_fft = fftshift(fft(original_array_1))
 array_2_fft = fftshift(fft(original_array_2))
 
-# Create the figure and subplots
-fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+# Create the figure and subplots for interactive rolling
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
-# Plot the first FFT with phplot using log scale
-axs[0].set_title('Array 1 FFT (Log Scale)')
-phplot(array_1_fft, axs[0], log_scale=True)
+# Initial plot
+array_1_fft_rolled = array_1_fft.clone()
+array_2_fft_rolled = array_2_fft.clone()
+phplot(array_1_fft_rolled, ax1)
+ax1.set_title('Array 1 FFT')
+phplot(array_2_fft_rolled, ax2)
+ax2.set_title('Array 2 FFT')
 
-# Plot the second FFT with phplot using log scale
-axs[1].set_title('Array 2 FFT (Log Scale)')
-phplot(array_2_fft, axs[1], log_scale=True)
+# After creating the plots
+start_x, start_y = 0, 0
 
-# Show the plots
+
+
+# In the main part of your script:
+fig.canvas.mpl_connect('button_press_event', on_press)
+fig.canvas.mpl_connect('button_release_event', on_release)
+fig.canvas.mpl_connect('motion_notify_event', drag_roll)
+
+# Remove the old roll_fft connection
+# fig.canvas.mpl_connect('button_press_event', roll_fft)
+ax_button = plt.axes([0.81, 0.05, 0.1, 0.075])
+button = Button(ax_button, 'Confirm')
+button.on_clicked(confirm)
+
 plt.show()
 
-rows_to_roll_1 = 0
-cols_to_roll_1 = 0
-rows_to_roll_2 = 0
-cols_to_roll_2 = 0
-
-# Roll the FFT results
-array_1_fft_rolled = np.roll(array_1_fft, shift=(rows_to_roll_1, cols_to_roll_1), axis=(0, 1))
-array_2_fft_rolled = np.roll(array_2_fft, shift=(rows_to_roll_2, cols_to_roll_2), axis=(0, 1))
-
-plt.figure()
-plt.subplot(1,2,1)
-plt.title('array 1 fft rolled')
-plt.imshow(np.abs(array_1_fft_rolled))
-plt.subplot(1,2,2)
-plt.title('array 2 fft rolled')
-plt.imshow(np.abs(array_2_fft_rolled))
-plt.show()
-
+# After the plot is closed, you can use array_1_fft_rolled and array_2_fft_rolled
 array_1 = ifft(ifftshift(array_1_fft_rolled))
 array_2 = ifft(ifftshift(array_2_fft_rolled))
-
+del ax1, ax2, ax_button, button, fig
 
 # hann = np.outer(*(2*[np.hanning(array_1.shape[-1])]))
 # hanned_1 = array_1 * hann
-# Fourier_1 = np.fft.fft2(hanned_1)
+# Fourier_1 = fft(hanned_1)
 # Fourier_1 *= hann
-# hanned_1 = np.fft.ifft2(Fourier_1)
+# hanned_1 = ifft(Fourier_1)
 
 # diffuzer = array_1 * np.exp(-1j * np.angle(array_2))
 
@@ -387,12 +366,13 @@ array_2 = ifft(ifftshift(array_2_fft_rolled))
 # plt.show()
 
 padding_size = 500
-padded_array_1 = np.pad(array_1, ((padding_size, padding_size), (padding_size, padding_size)), mode='constant')
-# plt.imshow(np.abs(padded_array))
-# plt.show()
-padded_array_2 = np.pad(array_2, ((padding_size, padding_size), (padding_size, padding_size)), mode='constant')
-# U0_1 = torch.from_numpy(padded_array_1).to(torch.complex64)
-# U0_2 = torch.from_numpy(padded_array_2).to(torch.complex64)
+# Pad array_1
+padded_array_1 = F.pad(array_1, (padding_size, padding_size, padding_size, padding_size), mode='constant', value=0)
+phplot(padded_array_1, log_scale=True)
+
+# Pad array_2
+padded_array_2 = F.pad(array_2, (padding_size, padding_size, padding_size, padding_size), mode='constant', value=0)
+
 
 
 
@@ -413,11 +393,23 @@ wavelength = 632.8e-9  # Wavelength (m)
 # Compute the field at different z-positions
 z_min_mm = -300
 z_max_mm = 300
-z_min, z_max = z_min_mm * 1e-3 ,z_max_mm * 1e-3
+z_min, z_max = z_min_mm * 1e-3, z_max_mm * 1e-3
 step_in_mm = 3
 num_z = int((z_max_mm - z_min_mm) // step_in_mm + 1)
 z_values = np.linspace(z_min, z_max, num_z)
+
+# Check if 0 is in the range and not already in z_values
+if z_min <= 0 <= z_max and 0 not in z_values:
+    # Find the index where 0 should be inserted
+    insert_index = np.searchsorted(z_values, 0)
+    # Insert 0 into z_values
+    z_values = np.insert(z_values, insert_index, 0)
+
+# Round the values
 z_values_rounded = np.round(z_values, 5)
+
+# Find the index of 0
+zero_index = np.where(z_values_rounded == 0)[0][0]
 
 # z_values = np.concatenate(([0], z_values))
 
@@ -445,8 +437,8 @@ for z in tqdm(z_values, desc='Computing fields'):
     field_1 = fresnel_propagation(padded_array_1, dx_1, dy_1, z, wavelength)
     field_2 = fresnel_propagation(padded_array_2, dx_2, dy_2, z, wavelength)
     # Normalization
-    field_1 /= np.max(np.abs(field_1))
-    field_2 /= np.max(np.abs(field_2))
+    field_1 /= torch.max(torch.abs(field_1))
+    field_2 /= torch.max(torch.abs(field_2))
 
     # Slice the padded array to retrieve the original field
     original_field_1 = field_1[start_row_1:end_row_1, start_col_1:end_col_1]
@@ -457,17 +449,20 @@ for z in tqdm(z_values, desc='Computing fields'):
     array_2_all.append(original_field_2)
     # diffuzer_all.append(current_diffuzer)
 
+
+array_1_all_numpy = [tensor.cpu().numpy() for tensor in array_1_all]
+array_2_all_numpy = [tensor.cpu().numpy() for tensor in array_2_all]
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 plt.subplots_adjust(bottom=0.3)
 
 extent_1 = [0, array_1.shape[1]*dx_1*1e3, 0, array_1.shape[0]*dy_1*1e3]
 extent_2 = [0, array_2.shape[1]*dx_2*1e3, 0, array_2.shape[0]*dy_2*1e3]
 
-im_1 = ax1.imshow(np.abs(array_1), cmap='hot', extent=extent_1)
+im_1 = ax1.imshow(np.abs(array_1_all_numpy[zero_index]), cmap='hot', extent=extent_1)
 ax1.set_title('Propagated Field 1')
 plt.colorbar(im_1, ax=ax1)
 
-im_2 = ax2.imshow(np.abs(array_2), cmap='hot', extent=extent_2)
+im_2 = ax2.imshow(np.abs(array_2_all_numpy[zero_index]), cmap='hot', extent=extent_2)
 ax2.set_title('Propagated Field 2')
 plt.colorbar(im_2, ax=ax2)
 
@@ -497,39 +492,10 @@ ylim2 = ax2.get_ylim()
 
 theta = np.deg2rad(0.5)
 
-# Define the update function
-# Define the update function
-def update(val):
-    z_index1 = int((slider1.val - z_min) / ((z_max - z_min) / (num_z - 1)))
-    im_1.set_data(np.abs(array_1_all[z_index1]))
-    ax1.set_title(f'Propagated Field 1 (z = {z_values[z_index1]:.2f} m)')
-    psf_size_1 = theta * z_values[z_index1] * 1e3  # in mm
-    normalized_psf_size_1 = np.abs(psf_size_1 / (extent_1[1] - extent_1[0]))  # Normalize relative to the plot's width
-    psf_line_1.set_data([0.05, 0.05 + normalized_psf_size_1], [0.9, 0.9])  # Horizontal line from (0.05, 0.9) to (0.05 + normalized_psf_size_1, 0.9)
-
-    z_index2 = int((slider2.val - z_min) / ((z_max - z_min) / (num_z - 1)))
-    im_2.set_data(np.abs(array_2_all[z_index2]))
-    ax2.set_title(f'Propagated Field 2 (z = {z_values[z_index2]:.2f} m)')
-    psf_size_2 = theta * z_values[z_index2] * 1e3  # in mm
-    normalized_psf_size_2 = np.abs(psf_size_2 / (extent_2[1] - extent_2[0]))  # Normalize relative to the plot's width
-    psf_line_2.set_data([0.05, 0.05 + normalized_psf_size_2], [0.9, 0.9])  # Horizontal line from (0.05, 0.9) to (0.05 + normalized_psf_size_2, 0.9)
-
-    ax1.set_xlim(xlim1)
-    ax1.set_ylim(ylim1)
-    ax2.set_xlim(xlim2)
-    ax2.set_ylim(ylim2)
-    fig.canvas.draw_idle()
-def store_zoom_levels(event):
-    global xlim1, ylim1, xlim2, ylim2
-    xlim1 = ax1.get_xlim()
-    ylim1 = ax1.get_ylim()
-    xlim2 = ax2.get_xlim()
-    ylim2 = ax2.get_ylim()
 
 # Add the sliders and connect the update function
 slider1.on_changed(update)
 slider2.on_changed(update)
-
 
 fig.canvas.mpl_connect('button_release_event', store_zoom_levels)
 
